@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "mbox-importer"
-version = "0.1.0"
+version = "0.1.1"
 description = "MemoGarden Mbox Email Importer - Import emails from mbox files into Soil"
 authors = ["MemoGarden Contributors"]
 readme = "README.md"

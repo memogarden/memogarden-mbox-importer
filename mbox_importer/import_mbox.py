@@ -182,6 +182,7 @@ class EmailImporter:
         self.soil = soil
         self.batch_size = batch_size
         self.email_index = self._build_index()
+        self.dedup_index = self._build_dedup_index()
         self.stats = {
             "processed": 0,
             "imported": 0,
@@ -193,18 +194,45 @@ class EmailImporter:
     def _build_index(self) -> dict[str, str]:
         """Build rfc_message_id -> uuid index for deduplication.
 
-        Scans existing Email items in database and builds mapping.
+        Scans existing Email items in database and builds mapping. The
+        scan is a projected SQL query (only uuid + rfc_message_id are
+        read) — fact-level materialization of a 12k-email corpus costs
+        ~700 MB of transient heap per importer construction.
 
         Returns:
             Dict mapping rfc_message_id to item UUID
         """
-        index = {}
-        emails = self.soil.list_items(_type="Email", limit=1000000)
-        for email_item in emails:
-            message_id = email_item.data.get("rfc_message_id")
-            if message_id:
-                index[message_id] = email_item.uuid
-        return index
+        rows = self.soil._get_connection().execute(
+            """SELECT uuid,
+                      json_extract(data, '$.rfc_message_id') AS mid
+               FROM item
+               WHERE _type = 'Email'"""
+        ).fetchall()
+        return {row["mid"]: row["uuid"] for row in rows if row["mid"]}
+
+    def _build_dedup_index(self) -> dict[tuple[str | None, str], str]:
+        """Build (account, rfc_message_id) -> uuid index for deduplication.
+
+        RFC-012 D1: each mailbox is an independent belief source — the same
+        message delivered to two accounts lands as two facts (linkable via
+        identical content), so the dedup key is account-qualified. Account
+        is metadata.account (None for sources without account attribution,
+        e.g. mbox files). Threading (email_index) stays global by
+        rfc_message_id: a reply may live in a different mailbox than the
+        original.
+        """
+        rows = self.soil._get_connection().execute(
+            """SELECT uuid,
+                      json_extract(data, '$.rfc_message_id') AS mid,
+                      json_extract(metadata, '$.account') AS account
+               FROM item
+               WHERE _type = 'Email'"""
+        ).fetchall()
+        return {
+            (row["account"], row["mid"]): row["uuid"]
+            for row in rows
+            if row["mid"]
+        }
 
     def import_email(self, email: dict) -> tuple[bool, int]:
         """Import single email with deduplication and threading.
@@ -216,9 +244,13 @@ class EmailImporter:
             Tuple of (imported: bool, relations_created: int)
         """
         message_id = email["data"]["rfc_message_id"]
+        dedup_key = (
+            (email.get("metadata") or {}).get("account"),
+            message_id,
+        )
 
-        # Check for duplicates
-        if message_id in self.email_index:
+        # Check for duplicates (per account — RFC-012 D1)
+        if dedup_key in self.dedup_index:
             self.stats["skipped"] += 1
             return (False, 0)
 
@@ -226,6 +258,7 @@ class EmailImporter:
         email_item = create_email_item(**email)
         uuid = self.soil.create_fact(email_item)
         self.stats["imported"] += 1
+        self.dedup_index[dedup_key] = uuid
         self.email_index[message_id] = uuid
 
         # Create threading relations
